@@ -67,7 +67,13 @@ with st.sidebar:
     st.caption("Upload → Extract → Classify → Review → Download")
 
 with st.container(border=True):
-    uploaded_files = st.file_uploader("📤 Upload vendor invoice PDFs", type="pdf", accept_multiple_files=True)
+    uploaded_files = st.file_uploader(
+        "📤 Upload vendor invoices — PDF or image (JPG, PNG, TIFF, WEBP, etc.)",
+        type=["pdf", "png", "jpg", "jpeg", "tiff", "tif", "bmp", "webp", "gif"],
+        accept_multiple_files=True,
+    )
+    if uploaded_files:
+        st.caption(f"{len(uploaded_files)} file(s) ready: " + ", ".join(f.name for f in uploaded_files))
     process_clicked = st.button("⚡ Process Invoices", type="primary")
 
 if process_clicked and uploaded_files:
@@ -79,10 +85,15 @@ if process_clicked and uploaded_files:
             out.write(f.getbuffer())
         file_paths.append(path)
 
-    with st.spinner(f"Processing {len(file_paths)} invoice(s)..."):
-        pipeline = InvoicePipeline(api_key=os.getenv("OPENAI_API_KEY"), config_path="gl_config.json")
-        st.session_state.pipeline = pipeline
-        st.session_state.vouchers = pipeline.run(file_paths, output_dir="outputs")
+    progress_bar = st.progress(0, text="Starting...")
+
+    def update_progress(idx, total, filename):
+        progress_bar.progress((idx) / total, text=f"Processing {idx + 1}/{total}: {filename}")
+
+    pipeline = InvoicePipeline(api_key=os.getenv("OPENAI_API_KEY"), config_path="gl_config.json")
+    st.session_state.pipeline = pipeline
+    st.session_state.vouchers = pipeline.run(file_paths, output_dir="outputs", progress_callback=update_progress)
+    progress_bar.progress(1.0, text="Done!")
     st.rerun()
 
 if st.session_state.vouchers:
