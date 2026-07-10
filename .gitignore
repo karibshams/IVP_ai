@@ -16,5 +16,3 @@ env/
 venv/
 ENV/
 build/
-Streamlit agent skills (environment-specific symlinks)
-.agents\skills/developing-with-streamlit/
