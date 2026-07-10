@@ -99,17 +99,36 @@ class GLConfig:
 # ---------------- Agents ----------------
 
 class IntakeAgent:
+    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
+
     def process(self, file_path: str) -> Invoice:
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".pdf":
+            return self._process_pdf(file_path)
+        if ext in self.IMAGE_EXTENSIONS:
+            return self._process_image(file_path)
+        raise ValueError(f"Unsupported file type: {ext}")
+
+    def _process_pdf(self, file_path: str) -> Invoice:
         doc = fitz.open(file_path)
         text = "\n".join(page.get_text() for page in doc)
         if not text.strip():
-            text = self._ocr(doc)
+            text = self._ocr_pdf(doc)
         doc.close()
         return Invoice(file_name=os.path.basename(file_path), raw_text=text, pdf_path=file_path)
 
-    def _ocr(self, doc) -> str:
-        import pytesseract
+    def _process_image(self, file_path: str) -> Invoice:
         from PIL import Image
+        import pytesseract
+        img = Image.open(file_path).convert("RGB")
+        text = pytesseract.image_to_string(img)
+        pdf_path = os.path.splitext(file_path)[0] + "_converted.pdf"
+        img.save(pdf_path, "PDF")
+        return Invoice(file_name=os.path.basename(file_path), raw_text=text, pdf_path=pdf_path)
+
+    def _ocr_pdf(self, doc) -> str:
+        from PIL import Image
+        import pytesseract
         text = ""
         for page in doc:
             pix = page.get_pixmap(dpi=300)
@@ -312,11 +331,14 @@ class InvoicePipeline:
         self.builder = VoucherBuilderAgent()
         self.pdf_gen = PDFGeneratorAgent()
 
-    def run(self, file_paths: List[str], output_dir: str) -> List[Voucher]:
+    def run(self, file_paths: List[str], output_dir: str, progress_callback=None) -> List[Voucher]:
         os.makedirs(output_dir, exist_ok=True)
         invoices = []
         seen_numbers = set()
-        for path in file_paths:
+        total = len(file_paths)
+        for idx, path in enumerate(file_paths):
+            if progress_callback:
+                progress_callback(idx, total, os.path.basename(path))
             inv = self.intake.process(path)
             inv = self.extractor.process(inv)
             inv = self.classifier.process(inv)
