@@ -45,7 +45,7 @@ st.markdown("""
 <div class="app-header">
     <div class="app-title">
         <div class="logo">🧾</div>
-        <div><h1>Invoice Voucher AI</h1><p>Zulich Group — Automated Voucher Processing</p></div>
+        <div><h1>Invoice Voucher AI</h1><p> Automated Voucher Processing</p></div>
     </div>
 </div>
 """, unsafe_allow_html=True)
