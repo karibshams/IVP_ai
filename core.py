@@ -100,22 +100,40 @@ class GLConfig:
 
 class IntakeAgent:
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
+    KEYWORDS = ["invoice", "date", "amount", "total", "vendor", "bill", "qty", "hst", "gst", "tax"]
 
-    def process(self, file_path: str) -> Invoice:
+    def process(self, file_path: str) -> List[Invoice]:
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".pdf":
             return self._process_pdf(file_path)
         if ext in self.IMAGE_EXTENSIONS:
-            return self._process_image(file_path)
+            return [self._process_image(file_path)]
         raise ValueError(f"Unsupported file type: {ext}")
 
-    def _process_pdf(self, file_path: str) -> Invoice:
+    def _process_pdf(self, file_path: str) -> List[Invoice]:
         doc = fitz.open(file_path)
-        text = "\n".join(page.get_text() for page in doc)
-        if not text.strip():
-            text = self._ocr_pdf(doc)
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        invoices = []
+        for page_num, page in enumerate(doc):
+            text = page.get_text()
+            if self._is_garbled(text):
+                text = self._ocr_page(page)
+            page_pdf_path = f"{os.path.splitext(file_path)[0]}_p{page_num + 1}.pdf"
+            self._save_single_page(file_path, page_num, page_pdf_path)
+            invoices.append(Invoice(
+                file_name=f"{base_name}_page{page_num + 1}",
+                raw_text=text,
+                pdf_path=page_pdf_path,
+            ))
         doc.close()
-        return Invoice(file_name=os.path.basename(file_path), raw_text=text, pdf_path=file_path)
+        return invoices
+
+    def _save_single_page(self, file_path: str, page_num: int, out_path: str):
+        src = PdfReader(file_path)
+        writer = PdfWriter()
+        writer.add_page(src.pages[page_num])
+        with open(out_path, "wb") as f:
+            writer.write(f)
 
     def _process_image(self, file_path: str) -> Invoice:
         from PIL import Image
@@ -126,15 +144,22 @@ class IntakeAgent:
         img.save(pdf_path, "PDF")
         return Invoice(file_name=os.path.basename(file_path), raw_text=text, pdf_path=pdf_path)
 
-    def _ocr_pdf(self, doc) -> str:
+    def _is_garbled(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return True
+        allowed = sum(1 for c in stripped if c.isalnum() or c.isspace() or c in ".,-/#$%()")
+        if allowed / len(stripped) < 0.85:
+            return True
+        lower = stripped.lower()
+        return not any(k in lower for k in self.KEYWORDS)
+
+    def _ocr_page(self, page) -> str:
         from PIL import Image
         import pytesseract
-        text = ""
-        for page in doc:
-            pix = page.get_pixmap(dpi=300)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            text += pytesseract.image_to_string(img) + "\n"
-        return text
+        pix = page.get_pixmap(dpi=300)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        return pytesseract.image_to_string(img)
 
 
 class ExtractorAgent:
@@ -162,7 +187,16 @@ class ExtractorAgent:
         invoice.invoice_amount = float(data.get("invoice_amount") or 0)
         invoice.net_amount = float(data.get("net_amount") or 0)
         invoice.hst = float(data.get("hst") or round(invoice.net_amount * HST_RATE, 2))
+        self._verify(invoice)
         return invoice
+
+    def _verify(self, invoice: Invoice):
+        text_lower = invoice.raw_text.lower()
+        vendor_words = [w for w in invoice.vendor.lower().split() if len(w) > 3]
+        if vendor_words and not any(w in text_lower for w in vendor_words):
+            invoice.flags.append("vendor_not_verified")
+        if invoice.invoice_number and invoice.invoice_number.lower() not in text_lower:
+            invoice.flags.append("invoice_number_not_verified")
 
 
 class ClassifierAgent:
@@ -339,11 +373,11 @@ class InvoicePipeline:
         for idx, path in enumerate(file_paths):
             if progress_callback:
                 progress_callback(idx, total, os.path.basename(path))
-            inv = self.intake.process(path)
-            inv = self.extractor.process(inv)
-            inv = self.classifier.process(inv)
-            inv = self.validator.process(inv, seen_numbers)
-            invoices.append(inv)
+            for inv in self.intake.process(path):
+                inv = self.extractor.process(inv)
+                inv = self.classifier.process(inv)
+                inv = self.validator.process(inv, seen_numbers)
+                invoices.append(inv)
 
         vouchers = self.builder.process(invoices)
         for v in vouchers:
