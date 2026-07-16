@@ -1,6 +1,5 @@
 import os
 import streamlit as st
-import pandas as pd
 from dotenv import load_dotenv
 from core import InvoicePipeline
 
@@ -125,30 +124,32 @@ for idx, v in enumerate(st.session_state.vouchers):
         c2.metric("HST", f"${v.total_hst:,.2f}")
         c3.metric("Total", f"${v.total_amount:,.2f}")
 
-        df = pd.DataFrame([{
+        rows = [{
             "Invoice #": i.invoice_number,
             "Date": i.invoice_date,
             "Amount": i.invoice_amount,
             "HST": i.hst,
+            "Company": i.company,
             "GL Code": i.gl_code,
             "GL Description": i.gl_description,
             "Profit Centre": f"{i.profit_centre_code} (R)" if i.is_rental else i.profit_centre_code,
             "Net": i.net_amount,
             "Confidence": i.confidence,
             "Flags": ", ".join(i.flags) if i.flags else "-",
-        } for i in v.invoices])
+        } for i in v.invoices]
 
         st.caption("Review and correct any fields below before generating the final voucher.")
-        edited = st.data_editor(df, key=f"editor_{idx}", num_rows="fixed", use_container_width=True)
+        edited = st.data_editor(rows, key=f"editor_{idx}", num_rows="fixed", use_container_width=True)
 
         col_gen, col_dl = st.columns([1, 1])
         with col_gen:
             if st.button("💾 Save Corrections & Generate PDF", key=f"gen_{idx}", use_container_width=True):
-                for i, row in zip(v.invoices, edited.to_dict("records")):
+                for i, row in zip(v.invoices, edited):
                     i.invoice_number = row["Invoice #"]
                     i.invoice_date = row["Date"]
                     i.invoice_amount = float(row["Amount"])
                     i.hst = float(row["HST"])
+                    i.company = row["Company"]
                     i.gl_code = row["GL Code"]
                     i.gl_description = row["GL Description"]
                     i.profit_centre_code = str(row["Profit Centre"]).replace(" (R)", "")
