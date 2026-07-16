@@ -1,18 +1,44 @@
 import os
 import io
+import time
 import json
 import base64
+import logging
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Callable
 from collections import defaultdict
 
 import fitz  # PyMuPDF
-from openai import OpenAI
+from openai import OpenAI, APIError, APITimeoutError, APIConnectionError
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from PyPDF2 import PdfReader, PdfWriter
+from PIL import Image
 
 HST_RATE = 0.13
+
+# Max dimensions for images sent to the vision API. PDFs rendered at 200 DPI can
+# produce very large PNGs; downscaling + JPEG compression keeps payloads close
+# to the size of a typical uploaded JPG, which reduces timeout/empty-response risk.
+MAX_IMAGE_DIMENSION = 1600
+JPEG_QUALITY = 80
+
+RETRYABLE_EXCEPTIONS = (APITimeoutError, APIConnectionError, APIError)
+
+
+def compress_image_bytes(raw_bytes: bytes) -> str:
+    """Resize (cap longest side) and re-encode any image bytes as a compressed
+    JPEG, returning base64. Used for both PDF-rendered pages and uploaded images
+    so every payload sent to the vision API is the same, lighter format."""
+    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    longest_side = max(img.size)
+    if longest_side > MAX_IMAGE_DIMENSION:
+        scale = MAX_IMAGE_DIMENSION / longest_side
+        new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
+        img = img.resize(new_size, Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 def vision_messages(prompt: str, image_base64: str) -> list:
@@ -23,9 +49,32 @@ def vision_messages(prompt: str, image_base64: str) -> list:
         "role": "user",
         "content": [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
         ],
     }]
+
+
+def call_with_retry(fn: Callable, max_attempts: int = 3, base_delay: float = 1.5):
+    """Run an OpenAI call and retry on empty/malformed responses or transient
+    API errors. Raises the last error/ValueError if all attempts are exhausted,
+    so callers can decide how to fail (e.g. flag one invoice instead of crashing
+    the whole batch)."""
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = fn()
+            content = resp.choices[0].message.content
+            if not content or not content.strip():
+                raise ValueError("Empty response content from OpenAI")
+            return resp
+        except (RETRYABLE_EXCEPTIONS, ValueError) as e:
+            last_err = e
+            if attempt < max_attempts:
+                logging.warning(f"OpenAI call failed (attempt {attempt}/{max_attempts}): {e}. Retrying...")
+                time.sleep(base_delay * attempt)
+            else:
+                logging.error(f"OpenAI call failed after {max_attempts} attempts: {e}")
+    raise last_err
 
 
 # ---------------- Data Models ----------------
@@ -130,7 +179,7 @@ class IntakeAgent:
         invoices = []
         for page_num, page in enumerate(doc):
             pix = page.get_pixmap(dpi=200)
-            image_b64 = base64.b64encode(pix.tobytes("png")).decode()
+            image_b64 = compress_image_bytes(pix.tobytes("png"))
             text = page.get_text()
             page_pdf_path = f"{os.path.splitext(file_path)[0]}_p{page_num + 1}.pdf"
             self._save_single_page(file_path, page_num, page_pdf_path)
@@ -151,11 +200,10 @@ class IntakeAgent:
             writer.write(f)
 
     def _process_image(self, file_path: str) -> Invoice:
-        from PIL import Image
         img = Image.open(file_path).convert("RGB")
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        image_b64 = base64.b64encode(buf.getvalue()).decode()
+        image_b64 = compress_image_bytes(buf.getvalue())
         pdf_path = os.path.splitext(file_path)[0] + "_converted.pdf"
         img.save(pdf_path, "PDF")
         return Invoice(file_name=os.path.basename(file_path), raw_text="", image_base64=image_b64, pdf_path=pdf_path)
@@ -189,11 +237,17 @@ class ExtractorAgent:
             "If this is a credit note or return, use negative values for invoice_amount, net_amount, and hst.\n"
             "If HST is not explicitly stated, calculate it as net_amount * 0.13."
         )
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=vision_messages(prompt, invoice.image_base64),
-            response_format={"type": "json_object"},
-        )
+        try:
+            resp = call_with_retry(lambda: self.client.chat.completions.create(
+                model=self.model,
+                messages=vision_messages(prompt, invoice.image_base64),
+                response_format={"type": "json_object"},
+            ))
+        except Exception as e:
+            invoice.flags.append("extraction_failed")
+            logging.error(f"Extraction failed for {invoice.file_name}: {e}")
+            return invoice
+
         data = json.loads(resp.choices[0].message.content)
         invoice.vendor = data.get("vendor", "")
         invoice.invoice_number = data.get("invoice_number", "")
@@ -252,11 +306,17 @@ class ClassifierAgent:
             "Choose only from this list of companies: " + ", ".join(companies) + ".\n"
             "Respond as JSON only: {company, confidence (0-1)}."
         )
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=vision_messages(prompt, invoice.image_base64),
-            response_format={"type": "json_object"},
-        )
+        try:
+            resp = call_with_retry(lambda: self.client.chat.completions.create(
+                model=self.model,
+                messages=vision_messages(prompt, invoice.image_base64),
+                response_format={"type": "json_object"},
+            ))
+        except Exception as e:
+            invoice.flags.append("classification_failed")
+            logging.error(f"Company match failed for {invoice.file_name}: {e}")
+            return "", 0.0
+
         data = json.loads(resp.choices[0].message.content)
         return data.get("company", ""), float(data.get("confidence") or 0)
 
@@ -270,11 +330,17 @@ class ClassifierAgent:
             "Respond as JSON only: {profit_centre_code, profit_centre_description, confidence (0-1)}.\n\n"
             f"Profit Centres: {json.dumps(profit_centres)}"
         )
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=vision_messages(prompt, invoice.image_base64),
-            response_format={"type": "json_object"},
-        )
+        try:
+            resp = call_with_retry(lambda: self.client.chat.completions.create(
+                model=self.model,
+                messages=vision_messages(prompt, invoice.image_base64),
+                response_format={"type": "json_object"},
+            ))
+        except Exception as e:
+            invoice.flags.append("classification_failed")
+            logging.error(f"Profit centre match failed for {invoice.file_name}: {e}")
+            return "", "", 0.0
+
         data = json.loads(resp.choices[0].message.content)
         return (data.get("profit_centre_code", ""), data.get("profit_centre_description", ""),
                 float(data.get("confidence") or 0))
@@ -287,11 +353,17 @@ class ClassifierAgent:
             "Respond as JSON only: {gl_code, gl_description, confidence (0-1)}.\n\n"
             f"GL Accounts: {json.dumps(gl_accounts)}"
         )
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=vision_messages(prompt, invoice.image_base64),
-            response_format={"type": "json_object"},
-        )
+        try:
+            resp = call_with_retry(lambda: self.client.chat.completions.create(
+                model=self.model,
+                messages=vision_messages(prompt, invoice.image_base64),
+                response_format={"type": "json_object"},
+            ))
+        except Exception as e:
+            invoice.flags.append("classification_failed")
+            logging.error(f"GL account match failed for {invoice.file_name}: {e}")
+            return "", "", 0.0
+
         data = json.loads(resp.choices[0].message.content)
         return data.get("gl_code", ""), data.get("gl_description", ""), float(data.get("confidence") or 0)
 
@@ -393,10 +465,23 @@ class InvoicePipeline:
         for idx, path in enumerate(file_paths):
             if progress_callback:
                 progress_callback(idx, total, os.path.basename(path))
-            for inv in self.intake.process(path):
-                inv = self.extractor.process(inv)
-                inv = self.classifier.process(inv)
-                inv = self.validator.process(inv, seen_numbers)
+            try:
+                page_invoices = self.intake.process(path)
+            except Exception as e:
+                logging.error(f"Intake failed for {path}: {e}")
+                inv = Invoice(file_name=os.path.basename(path), raw_text="")
+                inv.flags.append("extraction_failed")
+                invoices.append(inv)
+                continue
+            for inv in page_invoices:
+                try:
+                    inv = self.extractor.process(inv)
+                    inv = self.classifier.process(inv)
+                    inv = self.validator.process(inv, seen_numbers)
+                except Exception as e:
+                    logging.error(f"Processing failed for {inv.file_name}: {e}")
+                    if "extraction_failed" not in inv.flags:
+                        inv.flags.append("extraction_failed")
                 invoices.append(inv)
 
         vouchers = self.builder.process(invoices)
