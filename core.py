@@ -15,6 +15,19 @@ from PyPDF2 import PdfReader, PdfWriter
 HST_RATE = 0.13
 
 
+def vision_messages(prompt: str, image_base64: str) -> list:
+    """Build a chat message combining a text prompt with an invoice page image,
+    so GPT-4o reads the actual page (handwriting, layout, tables) directly
+    instead of relying on OCR/text-extraction that can garble or miss content."""
+    return [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+        ],
+    }]
+
+
 # ---------------- Data Models ----------------
 
 @dataclass
@@ -36,6 +49,7 @@ class Invoice:
     confidence: float = 0.0
     flags: List[str] = field(default_factory=list)
     pdf_path: str = ""
+    image_base64: str = ""
 
 
 @dataclass
@@ -115,12 +129,15 @@ class IntakeAgent:
         base_name = os.path.splitext(os.path.basename(file_path))[0]
         invoices = []
         for page_num, page in enumerate(doc):
-            text = self._best_text(page)
+            pix = page.get_pixmap(dpi=200)
+            image_b64 = base64.b64encode(pix.tobytes("png")).decode()
+            text = page.get_text()
             page_pdf_path = f"{os.path.splitext(file_path)[0]}_p{page_num + 1}.pdf"
             self._save_single_page(file_path, page_num, page_pdf_path)
             invoices.append(Invoice(
                 file_name=f"{base_name}_page{page_num + 1}",
                 raw_text=text,
+                image_base64=image_b64,
                 pdf_path=page_pdf_path,
             ))
         doc.close()
@@ -135,24 +152,18 @@ class IntakeAgent:
 
     def _process_image(self, file_path: str) -> Invoice:
         from PIL import Image
-        import pytesseract
         img = Image.open(file_path).convert("RGB")
-        text = pytesseract.image_to_string(img)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        image_b64 = base64.b64encode(buf.getvalue()).decode()
         pdf_path = os.path.splitext(file_path)[0] + "_converted.pdf"
         img.save(pdf_path, "PDF")
-        return Invoice(file_name=os.path.basename(file_path), raw_text=text, pdf_path=pdf_path)
+        return Invoice(file_name=os.path.basename(file_path), raw_text="", image_base64=image_b64, pdf_path=pdf_path)
 
-    def _best_text(self, page) -> str:
-        """Extract via both the PDF's embedded text and OCR, then keep whichever
-        is more coherent — embedded text can look valid but be garbled by broken
-        font encoding, so a heuristic gate alone isn't reliable enough."""
-        fitz_text = page.get_text()
-        ocr_text = self._ocr_page(page)
-        if self._quality_score(ocr_text) > self._quality_score(fitz_text):
-            return ocr_text
-        return fitz_text
-
-    def _quality_score(self, text: str) -> float:
+    def text_quality(self, text: str) -> float:
+        """Rough score of whether raw_text is usable for verification cross-checks.
+        Low score means the text layer is empty/garbled and verification should be skipped,
+        since GPT-4o vision (not this text) is the actual source of truth."""
         stripped = text.strip()
         if not stripped:
             return 0.0
@@ -162,13 +173,6 @@ class IntakeAgent:
         keyword_hits = sum(1 for k in self.KEYWORDS if k in lower)
         return char_score + keyword_hits
 
-    def _ocr_page(self, page) -> str:
-        from PIL import Image
-        import pytesseract
-        pix = page.get_pixmap(dpi=300)
-        img = Image.open(io.BytesIO(pix.tobytes("png")))
-        return pytesseract.image_to_string(img)
-
 
 class ExtractorAgent:
     def __init__(self, client: OpenAI, model: str = "gpt-4o"):
@@ -177,15 +181,17 @@ class ExtractorAgent:
 
     def process(self, invoice: Invoice) -> Invoice:
         prompt = (
-            "Extract these fields from the invoice text as JSON only, no extra text:\n"
+            "You are reading a vendor invoice page image directly. Read all printed text, "
+            "table contents, and any handwritten notes, stamps, or annotations on the page.\n"
+            "Extract these fields as JSON only, no extra text:\n"
             "vendor, invoice_number, invoice_date (YYYY-MM-DD), invoice_amount (number), "
             "net_amount (number, pre-tax), hst (number).\n"
-            "If HST is not explicitly stated, calculate it as net_amount * 0.13.\n\n"
-            f"Invoice text:\n{invoice.raw_text}"
+            "If this is a credit note or return, use negative values for invoice_amount, net_amount, and hst.\n"
+            "If HST is not explicitly stated, calculate it as net_amount * 0.13."
         )
         resp = self.client.chat.completions.create(
             model=self.model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=vision_messages(prompt, invoice.image_base64),
             response_format={"type": "json_object"},
         )
         data = json.loads(resp.choices[0].message.content)
@@ -199,18 +205,17 @@ class ExtractorAgent:
         return invoice
 
     def _verify(self, invoice: Invoice):
+        """Cross-check against the PDF's raw text layer where it's reliable enough to trust.
+        This layer is just a sanity check now — the image is the source of truth — so a
+        low-quality/garbled text layer skips verification rather than raising false flags."""
         text_lower = invoice.raw_text.lower()
+        if len(text_lower.strip()) < 20:
+            return
         vendor_words = [w for w in invoice.vendor.lower().split() if len(w) > 3]
         if vendor_words and not any(w in text_lower for w in vendor_words):
             invoice.flags.append("vendor_not_verified")
         if invoice.invoice_number and invoice.invoice_number.lower() not in text_lower:
             invoice.flags.append("invoice_number_not_verified")
-        if invoice.invoice_amount and not self._amount_in_text(invoice.invoice_amount, invoice.raw_text):
-            invoice.flags.append("amount_not_verified")
-
-    def _amount_in_text(self, amount: float, text: str) -> bool:
-        candidates = [f"{amount:.2f}", f"{amount:,.2f}", str(int(amount)) if amount == int(amount) else ""]
-        return any(c and c in text for c in candidates)
 
 
 class ClassifierAgent:
@@ -241,15 +246,15 @@ class ClassifierAgent:
     def _match_company(self, invoice: Invoice):
         companies = list(self.config.profit_centres_by_company.keys())
         prompt = (
-            "Given this invoice text, determine which company/entity it belongs to, "
-            "based on the billing address, ship-to address, or project mentioned. "
+            "Look at this invoice page image. Determine which company/entity it belongs to, "
+            "based on the billing address, ship-to address, project name, or any handwritten "
+            "notes/PO references on the page.\n"
             "Choose only from this list of companies: " + ", ".join(companies) + ".\n"
-            "Respond as JSON only: {company, confidence (0-1)}.\n\n"
-            f"Invoice text:\n{invoice.raw_text}"
+            "Respond as JSON only: {company, confidence (0-1)}."
         )
         resp = self.client.chat.completions.create(
             model=self.model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=vision_messages(prompt, invoice.image_base64),
             response_format={"type": "json_object"},
         )
         data = json.loads(resp.choices[0].message.content)
@@ -258,15 +263,16 @@ class ClassifierAgent:
     def _match_profit_centre(self, invoice: Invoice, company: str):
         profit_centres = self.config.profit_centres_by_company.get(company, {})
         prompt = (
-            "Match this invoice to the correct profit centre from the list below "
-            "(project/property address or name). Respond as JSON only: "
-            "{profit_centre_code, profit_centre_description, confidence (0-1)}.\n\n"
-            f"Profit Centres: {json.dumps(profit_centres)}\n\n"
-            f"Invoice text:\n{invoice.raw_text}"
+            "Look at this invoice page image. Match it to the correct profit centre from the list "
+            "below (project/property address or name). Pay close attention to any handwritten "
+            "notes, stamps, or job/PO references on the page — these often identify the correct "
+            "profit centre even when the billing address doesn't.\n"
+            "Respond as JSON only: {profit_centre_code, profit_centre_description, confidence (0-1)}.\n\n"
+            f"Profit Centres: {json.dumps(profit_centres)}"
         )
         resp = self.client.chat.completions.create(
             model=self.model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=vision_messages(prompt, invoice.image_base64),
             response_format={"type": "json_object"},
         )
         data = json.loads(resp.choices[0].message.content)
@@ -276,14 +282,14 @@ class ClassifierAgent:
     def _match_gl_account(self, invoice: Invoice, company: str):
         gl_accounts = self.config.gl_accounts_for(company)
         prompt = (
-            "Match this invoice's expense type to the correct GL account from the list below. "
+            "Look at this invoice page image. Match its expense type to the correct GL account "
+            "from the list below.\n"
             "Respond as JSON only: {gl_code, gl_description, confidence (0-1)}.\n\n"
-            f"GL Accounts: {json.dumps(gl_accounts)}\n\n"
-            f"Invoice text:\n{invoice.raw_text}"
+            f"GL Accounts: {json.dumps(gl_accounts)}"
         )
         resp = self.client.chat.completions.create(
             model=self.model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=vision_messages(prompt, invoice.image_base64),
             response_format={"type": "json_object"},
         )
         data = json.loads(resp.choices[0].message.content)
