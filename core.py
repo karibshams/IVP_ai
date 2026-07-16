@@ -67,7 +67,7 @@ def call_with_retry(fn: Callable, max_attempts: int = 3, base_delay: float = 1.5
             if not content or not content.strip():
                 raise ValueError("Empty response content from OpenAI")
             return resp
-        except (RETRYABLE_EXCEPTIONS, ValueError) as e:
+        except RETRYABLE_EXCEPTIONS + (ValueError,) as e:
             last_err = e
             if attempt < max_attempts:
                 logging.warning(f"OpenAI call failed (attempt {attempt}/{max_attempts}): {e}. Retrying...")
