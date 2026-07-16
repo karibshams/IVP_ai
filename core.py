@@ -115,9 +115,7 @@ class IntakeAgent:
         base_name = os.path.splitext(os.path.basename(file_path))[0]
         invoices = []
         for page_num, page in enumerate(doc):
-            text = page.get_text()
-            if self._is_garbled(text):
-                text = self._ocr_page(page)
+            text = self._best_text(page)
             page_pdf_path = f"{os.path.splitext(file_path)[0]}_p{page_num + 1}.pdf"
             self._save_single_page(file_path, page_num, page_pdf_path)
             invoices.append(Invoice(
@@ -144,15 +142,25 @@ class IntakeAgent:
         img.save(pdf_path, "PDF")
         return Invoice(file_name=os.path.basename(file_path), raw_text=text, pdf_path=pdf_path)
 
-    def _is_garbled(self, text: str) -> bool:
+    def _best_text(self, page) -> str:
+        """Extract via both the PDF's embedded text and OCR, then keep whichever
+        is more coherent — embedded text can look valid but be garbled by broken
+        font encoding, so a heuristic gate alone isn't reliable enough."""
+        fitz_text = page.get_text()
+        ocr_text = self._ocr_page(page)
+        if self._quality_score(ocr_text) > self._quality_score(fitz_text):
+            return ocr_text
+        return fitz_text
+
+    def _quality_score(self, text: str) -> float:
         stripped = text.strip()
         if not stripped:
-            return True
+            return 0.0
         allowed = sum(1 for c in stripped if c.isalnum() or c.isspace() or c in ".,-/#$%()")
-        if allowed / len(stripped) < 0.85:
-            return True
+        char_score = allowed / len(stripped)
         lower = stripped.lower()
-        return not any(k in lower for k in self.KEYWORDS)
+        keyword_hits = sum(1 for k in self.KEYWORDS if k in lower)
+        return char_score + keyword_hits
 
     def _ocr_page(self, page) -> str:
         from PIL import Image
@@ -197,6 +205,12 @@ class ExtractorAgent:
             invoice.flags.append("vendor_not_verified")
         if invoice.invoice_number and invoice.invoice_number.lower() not in text_lower:
             invoice.flags.append("invoice_number_not_verified")
+        if invoice.invoice_amount and not self._amount_in_text(invoice.invoice_amount, invoice.raw_text):
+            invoice.flags.append("amount_not_verified")
+
+    def _amount_in_text(self, amount: float, text: str) -> bool:
+        candidates = [f"{amount:.2f}", f"{amount:,.2f}", str(int(amount)) if amount == int(amount) else ""]
+        return any(c and c in text for c in candidates)
 
 
 class ClassifierAgent:
