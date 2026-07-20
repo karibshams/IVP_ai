@@ -51,6 +51,8 @@ st.markdown("""
 
 if "vouchers" not in st.session_state:
     st.session_state.vouchers = []
+if "voucher_pdfs" not in st.session_state:
+    st.session_state.voucher_pdfs = {}
 
 with st.sidebar:
     st.markdown("### 🧾 Invoice Voucher AI")
@@ -76,13 +78,7 @@ with st.container(border=True):
     process_clicked = st.button("⚡ Process Invoices", type="primary")
 
 if process_clicked and uploaded_files:
-    os.makedirs("uploads", exist_ok=True)
-    file_paths = []
-    for f in uploaded_files:
-        path = os.path.join("uploads", f.name)
-        with open(path, "wb") as out:
-            out.write(f.getbuffer())
-        file_paths.append(path)
+    file_tuples = [(f.name, f.getvalue()) for f in uploaded_files]
 
     progress_bar = st.progress(0, text="Starting...")
 
@@ -91,7 +87,11 @@ if process_clicked and uploaded_files:
 
     pipeline = InvoicePipeline(api_key=os.getenv("OPENAI_API_KEY"), config_path="gl_config.json")
     st.session_state.pipeline = pipeline
-    st.session_state.vouchers = pipeline.run(file_paths, output_dir="outputs", progress_callback=update_progress)
+    st.session_state.vouchers = pipeline.run(file_tuples, progress_callback=update_progress)
+    st.session_state.voucher_pdfs = {}
+    for v in st.session_state.vouchers:
+        safe_name = f"{v.vendor}_{v.company}".replace(" ", "_").replace("/", "_")
+        st.session_state.voucher_pdfs[safe_name] = pipeline.pdf_gen.process(v)
     progress_bar.progress(1.0, text="Done!")
     st.rerun()
 
@@ -142,6 +142,7 @@ for idx, v in enumerate(st.session_state.vouchers):
         edited = st.data_editor(rows, key=f"editor_{idx}", num_rows="fixed", use_container_width=True)
 
         col_gen, col_dl = st.columns([1, 1])
+        safe_name = f"{v.vendor}_{v.company}".replace(" ", "_").replace("/", "_")
         with col_gen:
             if st.button("💾 Save Corrections & Generate PDF", key=f"gen_{idx}", use_container_width=True):
                 for i, row in zip(v.invoices, edited):
@@ -155,15 +156,11 @@ for idx, v in enumerate(st.session_state.vouchers):
                     i.profit_centre_code = str(row["Profit Centre"]).replace(" (R)", "")
                     i.net_amount = float(row["Net"])
 
-                safe_name = f"{v.vendor}_{v.company}".replace(" ", "_").replace("/", "_")
-                out_path = os.path.join("outputs", f"voucher_{safe_name}.pdf")
-                st.session_state.pipeline.pdf_gen.process(v, out_path)
+                st.session_state.voucher_pdfs[safe_name] = st.session_state.pipeline.pdf_gen.process(v)
                 st.success("Voucher updated with your corrections.")
 
-        safe_name = f"{v.vendor}_{v.company}".replace(" ", "_").replace("/", "_")
-        out_path = os.path.join("outputs", f"voucher_{safe_name}.pdf")
         with col_dl:
-            if os.path.exists(out_path):
-                with open(out_path, "rb") as f:
-                    st.download_button("⬇️ Download Voucher PDF", f, file_name=os.path.basename(out_path),
-                                        key=f"dl_{idx}", use_container_width=True)
+            pdf_bytes = st.session_state.voucher_pdfs.get(safe_name)
+            if pdf_bytes:
+                st.download_button("⬇️ Download Voucher PDF", pdf_bytes, file_name=f"voucher_{safe_name}.pdf",
+                                    key=f"dl_{idx}", use_container_width=True)

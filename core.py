@@ -97,7 +97,7 @@ class Invoice:
     company: str = ""
     confidence: float = 0.0
     flags: List[str] = field(default_factory=list)
-    pdf_path: str = ""
+    pdf_bytes: bytes = b""
     image_base64: str = ""
 
 
@@ -165,48 +165,47 @@ class IntakeAgent:
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
     KEYWORDS = ["invoice", "date", "amount", "total", "vendor", "bill", "qty", "hst", "gst", "tax"]
 
-    def process(self, file_path: str) -> List[Invoice]:
-        ext = os.path.splitext(file_path)[1].lower()
+    def process(self, file_bytes: bytes, filename: str) -> List[Invoice]:
+        ext = os.path.splitext(filename)[1].lower()
         if ext == ".pdf":
-            return self._process_pdf(file_path)
+            return self._process_pdf(file_bytes, filename)
         if ext in self.IMAGE_EXTENSIONS:
-            return [self._process_image(file_path)]
+            return [self._process_image(file_bytes, filename)]
         raise ValueError(f"Unsupported file type: {ext}")
 
-    def _process_pdf(self, file_path: str) -> List[Invoice]:
-        doc = fitz.open(file_path)
-        base_name = os.path.splitext(os.path.basename(file_path))[0]
+    def _process_pdf(self, file_bytes: bytes, filename: str) -> List[Invoice]:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        base_name = os.path.splitext(filename)[0]
         invoices = []
         for page_num, page in enumerate(doc):
             pix = page.get_pixmap(dpi=200)
             image_b64 = compress_image_bytes(pix.tobytes("png"))
             text = page.get_text()
-            page_pdf_path = f"{os.path.splitext(file_path)[0]}_p{page_num + 1}.pdf"
-            self._save_single_page(file_path, page_num, page_pdf_path)
+            page_pdf_bytes = self._extract_single_page(doc, page_num)
             invoices.append(Invoice(
                 file_name=f"{base_name}_page{page_num + 1}",
                 raw_text=text,
                 image_base64=image_b64,
-                pdf_path=page_pdf_path,
+                pdf_bytes=page_pdf_bytes,
             ))
         doc.close()
         return invoices
 
-    def _save_single_page(self, file_path: str, page_num: int, out_path: str):
-        src = PdfReader(file_path)
-        writer = PdfWriter()
-        writer.add_page(src.pages[page_num])
-        with open(out_path, "wb") as f:
-            writer.write(f)
+    def _extract_single_page(self, doc, page_num: int) -> bytes:
+        single_page_doc = fitz.open()
+        single_page_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+        out_buf = io.BytesIO(single_page_doc.tobytes())
+        single_page_doc.close()
+        return out_buf.getvalue()
 
-    def _process_image(self, file_path: str) -> Invoice:
-        img = Image.open(file_path).convert("RGB")
+    def _process_image(self, file_bytes: bytes, filename: str) -> Invoice:
+        img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         image_b64 = compress_image_bytes(buf.getvalue())
-        pdf_path = os.path.splitext(file_path)[0] + "_converted.pdf"
-        img.save(pdf_path, "PDF")
-        return Invoice(file_name=os.path.basename(file_path), raw_text="", image_base64=image_b64, pdf_path=pdf_path)
+        pdf_buf = io.BytesIO()
+        img.save(pdf_buf, "PDF")
+        return Invoice(file_name=filename, raw_text="", image_base64=image_b64, pdf_bytes=pdf_buf.getvalue())
 
     def text_quality(self, text: str) -> float:
         """Rough score of whether raw_text is usable for verification cross-checks.
@@ -402,7 +401,7 @@ class VoucherBuilderAgent:
 
 
 class PDFGeneratorAgent:
-    def process(self, voucher: Voucher, output_path: str) -> str:
+    def process(self, voucher: Voucher) -> bytes:
         buf = io.BytesIO()
         c = canvas.Canvas(buf, pagesize=letter)
         width, height = letter
@@ -437,13 +436,15 @@ class PDFGeneratorAgent:
         for page in voucher_pdf.pages:
             writer.add_page(page)
         for inv in voucher.invoices:
-            src = PdfReader(inv.pdf_path)
+            if not inv.pdf_bytes:
+                continue
+            src = PdfReader(io.BytesIO(inv.pdf_bytes))
             for page in src.pages:
                 writer.add_page(page)
 
-        with open(output_path, "wb") as f:
-            writer.write(f)
-        return output_path
+        out_buf = io.BytesIO()
+        writer.write(out_buf)
+        return out_buf.getvalue()
 
 
 class InvoicePipeline:
@@ -457,19 +458,19 @@ class InvoicePipeline:
         self.builder = VoucherBuilderAgent()
         self.pdf_gen = PDFGeneratorAgent()
 
-    def run(self, file_paths: List[str], output_dir: str, progress_callback=None) -> List[Voucher]:
-        os.makedirs(output_dir, exist_ok=True)
+    def run(self, files: List[tuple], progress_callback=None) -> List[Voucher]:
+        """files: list of (filename, file_bytes) tuples — fully in-memory, nothing touches disk."""
         invoices = []
         seen_numbers = set()
-        total = len(file_paths)
-        for idx, path in enumerate(file_paths):
+        total = len(files)
+        for idx, (filename, file_bytes) in enumerate(files):
             if progress_callback:
-                progress_callback(idx, total, os.path.basename(path))
+                progress_callback(idx, total, filename)
             try:
-                page_invoices = self.intake.process(path)
+                page_invoices = self.intake.process(file_bytes, filename)
             except Exception as e:
-                logging.error(f"Intake failed for {path}: {e}")
-                inv = Invoice(file_name=os.path.basename(path), raw_text="")
+                logging.error(f"Intake failed for {filename}: {e}")
+                inv = Invoice(file_name=filename, raw_text="")
                 inv.flags.append("extraction_failed")
                 invoices.append(inv)
                 continue
@@ -485,8 +486,4 @@ class InvoicePipeline:
                 invoices.append(inv)
 
         vouchers = self.builder.process(invoices)
-        for v in vouchers:
-            safe_name = f"{v.vendor}_{v.company}".replace(" ", "_").replace("/", "_")
-            out_path = os.path.join(output_dir, f"voucher_{safe_name}.pdf")
-            self.pdf_gen.process(v, out_path)
         return vouchers
